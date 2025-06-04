@@ -1,2 +1,38 @@
-# Ignore sensitive config
+# Ignore sensitive config files
 config.json
+*.pem
+*.key
+*.env
+.env
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Database files
+*.db
+*.db-*
+user_history.db
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Debug logs
+*.log
+debug/
+
+# Temporary files
+tmp/
+temp/
+
+# Dependency directories
+vendor/
