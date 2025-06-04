@@ -493,7 +493,7 @@ async fn main() -> Result<()> {
 
 async fn get_insult_with_custom_info(openai_token: &str, username: &str, _user_text: &str, history: &str, user_data: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
     let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a 4chan shitposter. Give short, blunt insults. NO flowery language. NO metaphors. NO Game of Thrones style. Just raw, direct savage burns. Use words like 'anon', 'based', 'cringe', 'kek', etc. ONE OR TWO SENTENCES MAX. Be specific about their flaws. Never be poetic or philosophical." }),
+        serde_json::json!({ "role": "system", "content": "You are a mean, sarcastic asshole. Give short, blunt insults. NO flowery language. NO metaphors. NO Game of Thrones style. Just raw, direct savage burns. ONE OR TWO SENTENCES MAX. Be specific about their flaws. Never be poetic or philosophical, except when it allows you to be even more savage." }),
     ];
 
     if !history.is_empty() {
@@ -514,7 +514,7 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, _user_t
     let prompt_content = if !custom_prompt.is_empty() {
         format!("I'm {}. {}", username, custom_prompt)
     } else {
-        format!("I'm {}. Roast me based on the data you have. Be specific about my flaws from my message history. Keep it short and savage.", username)
+        format!(" Roast {} based on the data you have. Be specific about my flaws from my message history. Keep it short and savage.", username)
     };
     
     messages.push(serde_json::json!({ "role": "user", "content": prompt_content }));
@@ -546,7 +546,7 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, _user_t
 
 async fn get_insult(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str) -> Result<String> {
     let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a 4chan shitposter. Give short, blunt insults. NO flowery language. NO metaphors. NO Game of Thrones style. Just raw, direct savage burns. Use words like 'anon', 'based', 'cringe', 'kek', etc. ONE OR TWO SENTENCES MAX. Be specific about their flaws. Never be poetic or philosophical." }),
+        serde_json::json!({ "role": "system", "content": "You are a mean, sarcastic asshole. Give short, blunt insults. NO flowery language. NO metaphors. NO Game of Thrones style. Just raw, direct savage burns. ONE OR TWO SENTENCES MAX. Be specific about their flaws. Never be poetic or philosophical, except when it allows you to be even more savage." }),
     ];
 
     if !history.is_empty() {
