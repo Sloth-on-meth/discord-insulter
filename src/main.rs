@@ -208,47 +208,34 @@ impl Handler {
                 }
             }
         }
-        // Command format: !readmessages [channel_id]
+        // Command format: !readmessages
         else if content.starts_with("!readmessages") {
             log_info("Received !readmessages command");
             
-            // Parse optional channel ID from command
-            let target_channel_id = if content.len() > 13 { // "!readmessages ".len() = 13
-                let channel_id_str = content[13..].trim();
-                if !channel_id_str.is_empty() {
-                    match channel_id_str.parse::<u64>() {
-                        Ok(id) => Some(ChannelId::from(id)),
-                        Err(_) => {
-                            if let Err(why) = msg.channel_id.say(&ctx.http, "Invalid channel ID format. Using current channel.").await {
-                                log_error(&format!("Error sending message: {:?}", why));
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            
-            // Use specified channel or current channel
-            let channel_to_read = target_channel_id.unwrap_or(msg.channel_id);
-            
             // Send a status message
             if let Err(why) = msg.channel_id.say(&ctx.http, 
-                format!("Starting to read the last 2000 messages from channel <#{}>. This may take a while...", channel_to_read)
+                "Starting to read the last 100 messages from all channels. This may take a while..."
             ).await {
                 log_error(&format!("Error sending status message: {:?}", why));
             }
             
-            // Fetch messages from the channel
-            let messages = match channel_to_read.messages(&ctx.http, serenity::builder::GetMessages::default().limit(100)).await {
-                Ok(msgs) => msgs,
+            // Get all channels in the guild
+            let guild_id = match msg.guild_id {
+                Some(id) => id,
+                None => {
+                    if let Err(why) = msg.channel_id.say(&ctx.http, "This command must be used in a server.").await {
+                        log_error(&format!("Error sending message: {:?}", why));
+                    }
+                    return;
+                }
+            };
+            
+            let channels = match guild_id.channels(&ctx.http).await {
+                Ok(channels) => channels,
                 Err(e) => {
-                    log_error(&format!("Failed to fetch messages: {}", e));
+                    log_error(&format!("Failed to fetch channels: {}", e));
                     if let Err(why) = msg.channel_id.say(&ctx.http, 
-                        format!("Failed to fetch messages: {}", e)
+                        format!("Failed to fetch channels: {}", e)
                     ).await {
                         log_error(&format!("Error sending error message: {:?}", why));
                     }
@@ -256,7 +243,48 @@ impl Handler {
                 }
             };
             
-            log_info(&format!("Retrieved {} messages from channel {}", messages.len(), channel_to_read));
+            // Collect all messages from all channels
+            let mut all_messages = Vec::new();
+            let mut channels_processed = 0;
+            let mut channels_failed = 0;
+            
+            for (channel_id, _) in channels {
+                // Only process text channels
+                match channel_id.to_channel(&ctx.http).await {
+                    Ok(channel) => {
+                        // Check if this is a text channel
+                        match channel {
+                            serenity::model::channel::Channel::Guild(guild_channel) => {
+                                if !guild_channel.is_text_based() {
+                                    continue;
+                                }
+                            },
+                            // Skip non-guild channels or non-text channels
+                            _ => continue,
+                        }
+                    },
+                    Err(_) => continue,
+                }
+                
+                // Fetch messages from the channel
+                match channel_id.messages(&ctx.http, serenity::builder::GetMessages::default().limit(100)).await {
+                    Ok(msgs) => {
+                        log_info(&format!("Retrieved {} messages from channel {}", msgs.len(), channel_id));
+                        all_messages.extend(msgs);
+                        channels_processed += 1;
+                    },
+                    Err(e) => {
+                        log_error(&format!("Failed to fetch messages from channel {}: {}", channel_id, e));
+                        channels_failed += 1;
+                    }
+                };
+            }
+            
+            log_info(&format!("Retrieved a total of {} messages from {} channels ({} failed)", 
+                all_messages.len(), channels_processed, channels_failed));
+            
+            // Use the collected messages for processing
+            let messages = all_messages;
             
             // Process messages and store in database
             let mut users_processed = 0;
@@ -312,9 +340,36 @@ impl Handler {
                             .optional()
                             .unwrap_or(None);
                         
-                        // Append new data to existing data
+                        // Process new data to avoid repetition
                         let updated_data = match existing_data {
-                            Some(existing) => format!("{} {}", existing, combined_content),
+                            Some(existing) => {
+                                // Split existing data into words/phrases for deduplication
+                                let existing_words: std::collections::HashSet<String> = 
+                                    existing.split_whitespace()
+                                    .map(|s| s.to_lowercase())
+                                    .collect();
+                                
+                                // Filter out repetitive content
+                                let new_content: Vec<String> = combined_content
+                                    .split_whitespace()
+                                    .filter(|word| {
+                                        let lower = word.to_lowercase();
+                                        !existing_words.contains(&lower) || 
+                                        // Keep some common words that might be important in context
+                                        word.len() <= 3 || 
+                                        // Random sampling to keep some duplicates for context
+                                        rand::random::<f32>() < 0.2
+                                    })
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                
+                                // If we have new content after filtering, append it
+                                if !new_content.is_empty() {
+                                    format!("{} {}", existing, new_content.join(" "))
+                                } else {
+                                    existing
+                                }
+                            },
                             None => combined_content.clone()
                         };
                         
@@ -359,7 +414,7 @@ impl Handler {
                 `!insult @user [custom prompt]` - Generate and send an insult to the mentioned user in the insult channel\n\
                 `!insultall` - Generate insults for all users in the database\n\
                 `!showinfo @user` - Show all stored information about a user\n\
-                `!readmessages [channel_id]` - Read the last 2000 messages from the server or specified channel and store them in the database\n\
+                `!readmessages` - Read the last 100 messages from all channels and store them in the database\n\
                 `!help` - Show this help message\
             ";
             
@@ -416,19 +471,32 @@ impl Handler {
                     result
                 };
                 
-                // Format and send the info
+                // Format and send the info with stricter limits to avoid MessageTooLong errors
                 let mut info_text = format!("Information about {}:\n\n", user_name);
                 
+                // Discord has a 2000 character limit, so we need to be careful about the total length
+                // Reserve space for headers and formatting (about 200 characters)
+                const MAX_TOTAL_LENGTH: usize = 1800;
+                const MAX_CUSTOM_INFO: usize = 300;
+                const MAX_HISTORY: usize = 500;
+                const MAX_MESSAGE_DATA: usize = 800;
+                
+                // Add custom info with stricter limits
                 if let Some(info) = custom_info {
-                    info_text.push_str(&format!("**Custom Info**:\n{}\n\n", info));
+                    let truncated_info = if info.len() > MAX_CUSTOM_INFO {
+                        format!("{} [...truncated...]", &info[..MAX_CUSTOM_INFO])
+                    } else {
+                        info
+                    };
+                    info_text.push_str(&format!("**Custom Info**:\n{}\n\n", truncated_info));
                 } else {
                     info_text.push_str("**Custom Info**: None\n\n");
                 }
                 
+                // Add conversation history with stricter limits
                 if let Some(hist) = history {
-                    // Limit the amount of history shown to avoid Discord message limits
-                    let truncated_hist = if hist.len() > 1000 {
-                        format!("{} [...truncated...]", &hist[..1000])
+                    let truncated_hist = if hist.len() > MAX_HISTORY {
+                        format!("{} [...truncated...]", &hist[..MAX_HISTORY])
                     } else {
                         hist
                     };
@@ -437,10 +505,10 @@ impl Handler {
                     info_text.push_str("**Conversation History**: None\n\n");
                 }
                 
+                // Add message data with stricter limits
                 if let Some(data) = message_data {
-                    // Limit the amount of data shown to avoid Discord message limits
-                    let truncated_data = if data.len() > 1500 {
-                        format!("{} [...truncated...]", &data[..1500])
+                    let truncated_data = if data.len() > MAX_MESSAGE_DATA {
+                        format!("{} [...truncated...]", &data[..MAX_MESSAGE_DATA])
                     } else {
                         data
                     };
@@ -449,9 +517,18 @@ impl Handler {
                     info_text.push_str("**Message Data**: None");
                 }
                 
+                // Final check to ensure we're under Discord's limit
+                if info_text.len() > 2000 {
+                    info_text = format!(
+                        "Information about {}:\n\nWarning: Too much data to display completely. Showing truncated information.\n\n{}", 
+                        user_name,
+                        &info_text[..1900]
+                    );
+                }
+                
                 // Send the info
                 if let Err(why) = msg.channel_id.say(&ctx.http, info_text).await {
-                    eprintln!("Error sending user info: {:?}", why);
+                    log_error(&format!("Error sending user info: {:?}", why));
                 }
             } else {
                 if let Err(why) = msg.channel_id.say(&ctx.http, "Please mention a user: !showinfo @username").await {
