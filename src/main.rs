@@ -146,6 +146,7 @@ impl Handler {
                 **Admin Commands**\n\
                 `!addinfo @user <custom information>` - Add custom information about a user for insults\n\
                 `!insult @user [custom prompt]` - Generate and send an insult to the mentioned user in the insult channel\n\
+                `!insultall` - Generate insults for all users in the database\n\
                 `!showinfo @user` - Show all stored information about a user\n\
                 `!help` - Show this help message\
             ";
@@ -239,6 +240,108 @@ impl Handler {
                 if let Err(why) = msg.channel_id.say(&ctx.http, "Please mention a user: !showinfo @username").await {
                     eprintln!("Error sending error message: {:?}", why);
                 }
+            }
+        }
+        // Command format: !insultall
+        else if content == "!insultall" {
+            // First, get all user IDs from the database
+            let user_ids: Vec<String> = {
+                let db_lock = self.db.lock().unwrap();
+                
+                let mut stmt = db_lock.prepare("SELECT DISTINCT user_id FROM user_data").unwrap();
+                let user_id_iter = stmt.query_map([], |row| {
+                    Ok(row.get::<_, String>(0).unwrap())
+                }).unwrap();
+                
+                user_id_iter.filter_map(Result::ok).collect()
+            }; // db_lock is dropped here
+            
+            // Inform the admin that insults are being generated
+            let count = user_ids.len();
+            if count == 0 {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "No users found in the database.").await {
+                    eprintln!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+            
+            if let Err(why) = msg.channel_id.say(&ctx.http, 
+                format!("Generating insults for {} users. This may take some time...", count)
+            ).await {
+                eprintln!("Error sending message: {:?}", why);
+            }
+            
+            // Get the insult channel ID
+            let insult_channel_id = ChannelId::from(self.config.insult_channel_id.parse::<u64>().unwrap_or(0));
+            
+            // Process each user
+            for user_id in user_ids {
+                // Get user data and custom info
+                let (user_data, custom_info, username) = {
+                    let db_lock = self.db.lock().unwrap();
+                    
+                    // Get message data
+                    let data_opt: Option<String> = db_lock
+                        .query_row(
+                            "SELECT message_data FROM user_data WHERE user_id = ?1",
+                            params![&user_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    
+                    // Get custom info
+                    let info_opt: Option<String> = db_lock
+                        .query_row(
+                            "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                            params![&user_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    
+                    // Try to extract username from message data if available
+                    let username = if let Some(data) = &data_opt {
+                        if let Some(name_start) = data.find("]") {
+                            if let Some(name_end) = data[name_start+1..].find(":") {
+                                data[name_start+2..name_start+1+name_end].trim().to_string()
+                            } else {
+                                format!("User {}", user_id)
+                            }
+                        } else {
+                            format!("User {}", user_id)
+                        }
+                    } else {
+                        format!("User {}", user_id)
+                    };
+                    
+                    (data_opt.unwrap_or_default(), info_opt.unwrap_or_default(), username)
+                }; // db_lock is dropped here
+                
+                // Generate the insult
+                match get_insult_with_custom_info(&self.config.openai_token, &username, "", &"", &user_data, &custom_info, "").await {
+                    Ok(insult) => {
+                        // Send the insult to the insult channel and tag the user
+                        if let Err(why) = insult_channel_id.say(&ctx.http, 
+                            format!("<@{}> {}", user_id, insult)
+                        ).await {
+                            eprintln!("Error sending insult: {:?}", why);
+                        }
+                        
+                        // Add a small delay to avoid rate limiting
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    },
+                    Err(e) => {
+                        eprintln!("Error generating insult for {}: {}", username, e);
+                    }
+                }
+            }
+            
+            // Inform the admin that all insults have been sent
+            if let Err(why) = msg.channel_id.say(&ctx.http, 
+                format!("Finished sending insults to {} users.", count)
+            ).await {
+                eprintln!("Error sending message: {:?}", why);
             }
         }
     }
