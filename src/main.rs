@@ -162,6 +162,83 @@ impl Handler {
                 }
             }
         }
+        // Command format: !nicemessage @user [custom prompt]
+        else if content.starts_with("!nicemessage ") || content == "!nicemessage" {
+            log_info("Received !nicemessage command");
+            if let Some(user_mention) = msg.mentions.first() {
+                let user_id = user_mention.id.to_string();
+                let user_name = &user_mention.name;
+                
+                // Extract custom prompt if provided
+                let custom_prompt = if let Some(mention_end) = content.find('>'){
+                    content[mention_end + 1..].trim().to_string()
+                } else {
+                    String::new()
+                };
+                
+                // Get user data and custom info
+                let (user_data, custom_info) = {
+                    let db_lock = self.db.lock().unwrap();
+                    
+                    // Get message data
+                    let data_opt: Option<String> = db_lock
+                        .query_row(
+                            "SELECT message_data FROM user_data WHERE user_id = ?1",
+                            params![user_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    
+                    // Get custom info
+                    let info_opt: Option<String> = db_lock
+                        .query_row(
+                            "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                            params![&user_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    
+                    (data_opt.unwrap_or_default(), info_opt.unwrap_or_default())
+                };
+                
+                // Generate the nice message with custom prompt if provided
+                match get_nice_message_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &custom_info, &custom_prompt).await {
+                    Ok(nice_message) => {
+                        // Send the nice message to the insult channel and tag the user
+                        let insult_channel_id = ChannelId::from(self.config.insult_channel_id.parse::<u64>().unwrap_or(0));
+                        if let Err(why) = insult_channel_id.say(&ctx.http, 
+                            format!("<@{}> {}", user_id, nice_message)
+                        ).await {
+                            log_error(&format!("Error sending nice message: {:?}", why));
+                            
+                            // Notify admin that the nice message failed
+                            if let Err(why) = msg.channel_id.say(&ctx.http, 
+                                format!("Failed to send nice message to {}.", user_name)
+                            ).await {
+                                log_error(&format!("Error sending error message: {:?}", why));
+                            }
+                        } else {
+                            // Confirm the nice message was sent
+                            if let Err(why) = msg.channel_id.say(&ctx.http, 
+                                format!("Nice message sent to {} in the insult channel.", user_name)
+                            ).await {
+                                log_error(&format!("Error sending confirmation message: {:?}", why));
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log_error(&format!("Error generating nice message: {}", e));
+                        if let Err(why) = msg.channel_id.say(&ctx.http, 
+                            format!("Failed to generate nice message for {}: {}", user_name, e)
+                        ).await {
+                            log_error(&format!("Error sending error message: {:?}", why));
+                        }
+                    }
+                }
+            }
+        }
         // Command format: !clearinfo @user
         else if content.starts_with("!clearinfo") {
             log_info("Received !clearinfo command");
@@ -214,7 +291,7 @@ impl Handler {
             
             // Send a status message
             if let Err(why) = msg.channel_id.say(&ctx.http, 
-                "Starting to read the last 100 messages from all channels. This may take a while..."
+                "Starting to read all messages from all channels, 100 at a time. This may take a while..."
             ).await {
                 log_error(&format!("Error sending status message: {:?}", why));
             }
@@ -266,18 +343,54 @@ impl Handler {
                     Err(_) => continue,
                 }
                 
-                // Fetch messages from the channel
-                match channel_id.messages(&ctx.http, serenity::builder::GetMessages::default().limit(100)).await {
-                    Ok(msgs) => {
-                        log_info(&format!("Retrieved {} messages from channel {}", msgs.len(), channel_id));
-                        all_messages.extend(msgs);
-                        channels_processed += 1;
-                    },
-                    Err(e) => {
-                        log_error(&format!("Failed to fetch messages from channel {}: {}", channel_id, e));
-                        channels_failed += 1;
+                // Fetch all messages from the channel, 100 at a time
+                let mut channel_messages = Vec::new();
+                let mut last_message_id = None;
+                let mut total_channel_messages = 0;
+                
+                // Keep fetching messages until we've got them all
+                loop {
+                    let mut message_builder = serenity::builder::GetMessages::default().limit(100);
+                    
+                    // If we have a last message ID, use it to fetch older messages
+                    if let Some(id) = last_message_id {
+                        message_builder = message_builder.before(id);
                     }
-                };
+                    
+                    match channel_id.messages(&ctx.http, message_builder).await {
+                        Ok(msgs) => {
+                            let batch_size = msgs.len();
+                            total_channel_messages += batch_size;
+                            
+                            // If we got messages, update the last message ID for pagination
+                            if !msgs.is_empty() {
+                                last_message_id = Some(msgs.last().unwrap().id);
+                                channel_messages.extend(msgs);
+                            }
+                            
+                            // If we got fewer than 100 messages, we've reached the end
+                            if batch_size < 100 {
+                                break;
+                            }
+                            
+                            // Add a small delay to avoid rate limiting
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        },
+                        Err(e) => {
+                            log_error(&format!("Failed to fetch messages from channel {}: {}", channel_id, e));
+                            break;
+                        }
+                    }
+                }
+                
+                if !channel_messages.is_empty() {
+                    log_info(&format!("Retrieved {} messages from channel {}", total_channel_messages, channel_id));
+                    all_messages.extend(channel_messages);
+                    channels_processed += 1;
+                } else {
+                    log_info(&format!("No messages found in channel {}", channel_id));
+                    channels_failed += 1;
+                }
             }
             
             log_info(&format!("Retrieved a total of {} messages from {} channels ({} failed)", 
@@ -412,9 +525,10 @@ impl Handler {
                 `!addinfo @user <custom information>` - Add custom information about a user for insults\n\
                 `!clearinfo @user` - Clear all custom information about a user\n\
                 `!insult @user [custom prompt]` - Generate and send an insult to the mentioned user in the insult channel\n\
+                `!nicemessage @user [custom prompt]` - Generate and send a nice, positive message to the mentioned user\n\
                 `!insultall` - Generate insults for all users in the database\n\
                 `!showinfo @user` - Show all stored information about a user\n\
-                `!readmessages` - Read the last 100 messages from all channels and store them in the database\n\
+                `!readmessages` - Read all messages from all channels (100 at a time) and store them in the database\n\
                 `!help` - Show this help message\
             ";
             
@@ -740,6 +854,25 @@ fn log_error(message: &str) {
     eprintln!("[{}] ERROR: {}", now.format("%Y-%m-%d %H:%M:%S"), message);
 }
 
+// Debug function to log API request contents
+fn log_api_request(messages: &Vec<serde_json::Value>) {
+    let now = chrono::Local::now();
+    eprintln!("[{}] API REQUEST PAYLOAD:", now.format("%Y-%m-%d %H:%M:%S"));
+    for (i, msg) in messages.iter().enumerate() {
+        if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                let truncated = if content.len() > 100 {
+                    format!("{:.100}... [total: {} chars]", content, content.len())
+                } else {
+                    content.to_string()
+                };
+                eprintln!("  [{}] {}: {}", i, role, truncated);
+            }
+        }
+    }
+    eprintln!("[{}] END API REQUEST PAYLOAD", now.format("%Y-%m-%d %H:%M:%S"));
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
@@ -973,6 +1106,100 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn get_nice_message(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str) -> Result<String> {
+    let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": "You are a kind, supportive friend who gives genuine compliments and positive encouragement. Focus on the person's strengths and positive qualities. Be specific and personal in your compliments. ONE OR TWO SENTENCES MAX. Be warm, uplifting, and sincere." }),
+    ];
+
+    if !history.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("Previous conversation: {}", history) }));
+    }
+    
+    // Add user data if available
+    if !user_data.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("User's message history: {}", user_data) }));
+    }
+
+    messages.push(serde_json::json!({ "role": "user", "content": format!("I'm {}. My message: '{}'. Give me a nice, positive message based on this and my past messages. Keep it genuine and uplifting.", username, user_text) }));
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(openai_token)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages,
+            "max_tokens": 1000,
+            "temperature": 0.8 // Slightly lower temperature for more consistent positive messages
+        }))
+        .send()
+        .await?;
+
+    let res_json: serde_json::Value = res.json().await?;
+    
+    if let Some(choice) = res_json.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.get(0)) {
+        if let Some(message) = choice.get("message").and_then(|m| m.get("content")) {
+            if let Some(nice_str) = message.as_str() {
+                return Ok(nice_str.trim().to_string());
+            }
+        }
+    }
+    Ok("You're awesome! I wish I could come up with something more specific, but you're genuinely great.".to_string())
+}
+
+async fn get_nice_message_with_custom_info(openai_token: &str, username: &str, _user_text: &str, history: &str, user_data: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
+    let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": "You are a kind, supportive friend who gives genuine compliments and positive encouragement. Focus on the person's strengths and positive qualities. Be specific and personal in your compliments. ONE OR TWO SENTENCES MAX. Be warm, uplifting, and sincere." }),
+    ];
+
+    if !history.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("Previous conversation: {}", history) }));
+    }
+    
+    // Add user data if available
+    if !user_data.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("User's message history: {}", user_data) }));
+    }
+    
+    // Add custom information if available
+    if !custom_info.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("Special info about user: {}", custom_info) }));
+    }
+
+    // Use custom prompt if provided, otherwise use default
+    let prompt_content = if !custom_prompt.is_empty() {
+        format!("I'm {}. {}", username, custom_prompt)
+    } else {
+        format!("Give a nice, positive message to {} based on the data you have. Focus on their strengths and positive qualities from their message history. Keep it genuine and uplifting.", username)
+    };
+    
+    messages.push(serde_json::json!({ "role": "user", "content": prompt_content }));
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(openai_token)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages,
+            "max_tokens": 1000,
+            "temperature": 0.8 // Slightly lower temperature for more consistent positive messages
+        }))
+        .send()
+        .await?;
+
+    let res_json: serde_json::Value = res.json().await?;
+    
+    if let Some(choice) = res_json.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.get(0)) {
+        if let Some(message) = choice.get("message").and_then(|m| m.get("content")) {
+            if let Some(nice_str) = message.as_str() {
+                return Ok(nice_str.trim().to_string());
+            }
+        }
+    }
+    Ok("You're awesome! I wish I could come up with something more specific, but you're genuinely great.".to_string())
+}
+
 async fn get_insult_with_custom_info(openai_token: &str, username: &str, _user_text: &str, history: &str, user_data: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
     let mut messages = vec![
         serde_json::json!({ "role": "system", "content": "You are a witty, sarcastic comedian doing a roast. Give humorous insults that are funny rather than cruel. Use clever wordplay, puns, and playful teasing. ONE OR TWO SENTENCES MAX. but keep it light-hearted enough that the person being roasted would laugh too. Think Comedy Central Roast style but toned down a bit." }),
@@ -1041,6 +1268,9 @@ async fn get_insult(openai_token: &str, username: &str, user_text: &str, history
     }
 
     messages.push(serde_json::json!({ "role": "user", "content": format!("I'm {}. My message: '{}'. Roast me based on this and my past messages and custom info Keep it short and savage.", username, user_text) }));
+
+    // Log the API request payload for debugging
+    log_api_request(&messages);
 
     let client = reqwest::Client::new();
     let res = client
