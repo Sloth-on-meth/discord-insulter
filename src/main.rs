@@ -1,7 +1,7 @@
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
-use serenity::model::id::ChannelId;
+use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use serde::Deserialize;
 use std::fs;
@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use reqwest;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+// Removed unused SystemTime import
 // Removed unused HashMap import
 
 const MAX_HISTORY_CHARS: usize = 2000; // Max characters for conversation history
@@ -43,20 +43,38 @@ impl Handler {
                 if let Some(info_start) = content.find('>') {
                     let custom_info = content[info_start + 1..].trim().to_string();
                     if !custom_info.is_empty() {
-                        // Store the custom information
+                        // Store the custom information by appending to existing info
                         {
                             let db_lock = self.db.lock().unwrap();
+                            
+                            // First check if there's existing info
+                            let existing_info: Option<String> = db_lock
+                                .query_row(
+                                    "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                                    params![&user_id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .optional()
+                                .unwrap_or(None);
+                            
+                            // Append new info to existing info or create new entry
+                            let updated_info = match existing_info {
+                                Some(existing) => format!("{} \n• {}", existing, custom_info),
+                                None => custom_info.to_string(),
+                            };
+                            
+                            // Update the database
                             db_lock
                                 .execute(
                                     "INSERT OR REPLACE INTO custom_user_info (user_id, info) VALUES (?1, ?2)",
-                                    params![&user_id, &custom_info],
+                                    params![&user_id, &updated_info],
                                 )
                                 .expect("Failed to store custom user info");
                         }
                         
                         // Confirm the information was stored
                         if let Err(why) = msg.channel_id.say(&ctx.http, 
-                            format!("Custom information about {} has been stored for future insults.", user_name)
+                            format!("New custom information about {} has been added to their profile for future insults.", user_name)
                         ).await {
                             eprintln!("Error sending confirmation message: {:?}", why);
                         }
@@ -248,12 +266,31 @@ impl Handler {
             let user_ids: Vec<String> = {
                 let db_lock = self.db.lock().unwrap();
                 
-                let mut stmt = db_lock.prepare("SELECT DISTINCT user_id FROM user_data").unwrap();
-                let user_id_iter = stmt.query_map([], |row| {
-                    Ok(row.get::<_, String>(0).unwrap())
-                }).unwrap();
+                // Get IDs from both user_data and user_history tables to ensure we get all users
+                let mut ids = Vec::new();
                 
-                user_id_iter.filter_map(Result::ok).collect()
+                // From user_data
+                if let Ok(mut stmt) = db_lock.prepare("SELECT DISTINCT user_id FROM user_data") {
+                    if let Ok(user_id_iter) = stmt.query_map([], |row| {
+                        Ok(row.get::<_, String>(0).unwrap())
+                    }) {
+                        ids.extend(user_id_iter.filter_map(Result::ok));
+                    }
+                }
+                
+                // From user_history
+                if let Ok(mut stmt) = db_lock.prepare("SELECT DISTINCT user_id FROM user_history") {
+                    if let Ok(user_id_iter) = stmt.query_map([], |row| {
+                        Ok(row.get::<_, String>(0).unwrap())
+                    }) {
+                        ids.extend(user_id_iter.filter_map(Result::ok));
+                    }
+                }
+                
+                // Deduplicate
+                ids.sort();
+                ids.dedup();
+                ids
             }; // db_lock is dropped here
             
             // Inform the admin that insults are being generated
@@ -276,14 +313,24 @@ impl Handler {
             
             // Process each user
             for user_id in user_ids {
-                // Get user data and custom info
-                let (user_data, custom_info, username) = {
+                // First get database data without any awaits
+                let (user_data, history, custom_info, message_data_for_username) = {
                     let db_lock = self.db.lock().unwrap();
                     
                     // Get message data
                     let data_opt: Option<String> = db_lock
                         .query_row(
                             "SELECT message_data FROM user_data WHERE user_id = ?1",
+                            params![&user_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    
+                    // Get conversation history
+                    let history_opt: Option<String> = db_lock
+                        .query_row(
+                            "SELECT history FROM user_history WHERE user_id = ?1",
                             params![&user_id],
                             |row| row.get::<_, String>(0),
                         )
@@ -300,32 +347,73 @@ impl Handler {
                         .optional()
                         .unwrap_or(None);
                     
-                    // Try to extract username from message data if available
-                    let username = if let Some(data) = &data_opt {
-                        if let Some(name_start) = data.find("]") {
-                            if let Some(name_end) = data[name_start+1..].find(":") {
-                                data[name_start+2..name_start+1+name_end].trim().to_string()
+                    // Return all data and drop the lock
+                    let message_data_clone = data_opt.clone(); // Clone before using unwrap_or_default
+                    (
+                        data_opt.unwrap_or_default(),
+                        history_opt.unwrap_or_default(),
+                        info_opt.unwrap_or_default(),
+                        message_data_clone // Already cloned message data for username extraction
+                    )
+                }; // db_lock is dropped here
+                
+                // Now try to get username from Discord API (after lock is dropped)
+                let username = match UserId::from(user_id.parse::<u64>().unwrap_or(0)).to_user(&ctx.http).await {
+                    Ok(user) => user.name,
+                    Err(_) => {
+                        // Fallback: Try to extract username from message data if available
+                        if let Some(data) = &message_data_for_username {
+                            if let Some(name_start) = data.find("]") {
+                                if let Some(name_end) = data[name_start+1..].find(":") {
+                                    data[name_start+2..name_start+1+name_end].trim().to_string()
+                                } else {
+                                    format!("User {}", user_id)
+                                }
                             } else {
                                 format!("User {}", user_id)
                             }
                         } else {
                             format!("User {}", user_id)
                         }
-                    } else {
-                        format!("User {}", user_id)
-                    };
-                    
-                    (data_opt.unwrap_or_default(), info_opt.unwrap_or_default(), username)
-                }; // db_lock is dropped here
+                    }
+                };
+                
+                // Send a status message to admin channel
+                if let Err(why) = msg.channel_id.say(&ctx.http, 
+                    format!("Generating insult for {}...", username)
+                ).await {
+                    eprintln!("Error sending status message: {:?}", why);
+                }
                 
                 // Generate the insult
-                match get_insult_with_custom_info(&self.config.openai_token, &username, "", &"", &user_data, &custom_info, "").await {
+                match get_insult_with_custom_info(
+                    &self.config.openai_token, 
+                    &username, 
+                    "", 
+                    &history, 
+                    &user_data, 
+                    &custom_info, 
+                    ""
+                ).await {
                     Ok(insult) => {
                         // Send the insult to the insult channel and tag the user
                         if let Err(why) = insult_channel_id.say(&ctx.http, 
                             format!("<@{}> {}", user_id, insult)
                         ).await {
                             eprintln!("Error sending insult: {:?}", why);
+                            // Notify admin of failure
+                            if let Err(why2) = msg.channel_id.say(&ctx.http, 
+                                format!("Failed to send insult to {}: {:?}", username, why)
+                            ).await {
+                                eprintln!("Error sending error message: {:?}", why2);
+                            }
+                        } else {
+                            // Notify admin of success
+                            if let Err(why) = msg.channel_id.say(&ctx.http, 
+                                format!("Insult sent to {}.", username)
+                            ).await {
+                                eprintln!("Error sending confirmation message: {:?}", why);
+                            }
                         }
                         
                         // Add a small delay to avoid rate limiting
@@ -333,6 +421,12 @@ impl Handler {
                     },
                     Err(e) => {
                         eprintln!("Error generating insult for {}: {}", username, e);
+                        // Notify admin of failure
+                        if let Err(why) = msg.channel_id.say(&ctx.http, 
+                            format!("Failed to generate insult for {}: {}", username, e)
+                        ).await {
+                            eprintln!("Error sending error message: {:?}", why);
+                        }
                     }
                 }
             }
