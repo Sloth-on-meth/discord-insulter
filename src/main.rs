@@ -21,15 +21,7 @@ use std::sync::{Arc, Mutex};
 const MAX_HISTORY_CHARS: usize = 2000; // Max characters for conversation history
 const MAX_USER_DATA_CHARS: usize = 5000; // Max characters for user data collection
 
-// Humor categories for themed insults
-const HUMOR_CATEGORIES: [&str; 6] = [
-    "roast",           // Standard roast comedy
-    "dad_joke",        // Corny dad joke style insults
-    "shakespeare",     // Elizabethan-style insults
-    "sci_fi",          // Sci-fi themed insults
-    "surreal",         // Absurdist/surreal humor
-    "celebrity",       // Celebrity roast style
-];
+// Constants for data limits
 
 
 #[derive(Deserialize, Clone)]
@@ -348,7 +340,7 @@ impl Handler {
                 
                 // Get user data and custom info
                 // Get user data, summary, and custom info for the mentioned user
-                let (user_data, summary, custom_info) = {
+                let (user_data, _summary, custom_info) = {
                     let db_lock = self.db.lock().unwrap();
                     let mut data = String::new();
                     let mut summary = String::new();
@@ -762,7 +754,6 @@ impl Handler {
                 
                 // Discord has a 2000 character limit, so we need to be careful about the total length
                 // Reserve space for headers and formatting (about 200 characters)
-                const MAX_TOTAL_LENGTH: usize = 1800;
                 const MAX_CUSTOM_INFO: usize = 300;
                 const MAX_HISTORY: usize = 500;
                 const MAX_MESSAGE_DATA: usize = 800;
@@ -1122,31 +1113,7 @@ fn log_info(message: &str) {
 }
 
 // Random insult generator that doesn't use OpenAI API
-fn get_random_insult(username: &str) -> String {
-    use rand::seq::SliceRandom;
-    
-    let templates = [
-        "[NAME] has the charisma of a wet paper towel and half the absorption capacity.",
-        "If [NAME] were any more basic, they'd neutralize stomach acid.",
-        "[NAME] is living proof that evolution can go in reverse.",
-        "[NAME]'s brain runs on Internet Explorer... from 2003.",
-        "I'd roast [NAME], but my mom taught me not to burn trash.",
-        "[NAME] is about as useful as a screen door on a submarine.",
-        "[NAME] is the human equivalent of a participation trophy.",
-        "[NAME] is so dense, light bends around them.",
-        "[NAME] has the personality of a Discord loading screen.",
-        "[NAME] is the reason shampoo has instructions.",
-        "[NAME] is as deep as a puddle in the Sahara.",
-        "[NAME] has a face for radio and a voice for silent films.",
-        "[NAME]'s personality is like unseasoned chicken - bland and disappointing.",
-        "[NAME] is so slow, they'd lose a race with a loading bar.",
-        "[NAME] is the human equivalent of a 'Reply All' email disaster.",
-    ];
-    
-    let mut rng = rand::thread_rng();
-    let template = templates.choose(&mut rng).unwrap_or(&templates[0]);
-    template.replace("[NAME]", username)
-}
+// Function removed: get_random_insult - Not used in the current implementation
 
 fn log_error(message: &str) {
     let now = chrono::Local::now();
@@ -1576,46 +1543,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_nice_message(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str) -> Result<String> {
-    let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a kind, supportive friend who gives genuine compliments and positive encouragement. Focus on the person's strengths and positive qualities. Be specific and personal in your compliments. ONE OR TWO SENTENCES MAX. Be warm, uplifting, and sincere." }),
-    ];
-
-    if !history.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("Previous conversation: {}", history) }));
-    }
-    
-    // Add user data if available
-    if !user_data.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("User's message history: {}", user_data) }));
-    }
-
-    messages.push(serde_json::json!({ "role": "user", "content": format!("I'm {}. My message: '{}'. Give me a nice, positive message based on this and my past messages. Keep it genuine and uplifting.", username, user_text) }));
-
-    let client = reqwest::Client::new();
-    let res = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(openai_token)
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "messages": messages,
-            "max_tokens": 1000,
-            "temperature": 0.8 // Slightly lower temperature for more consistent positive messages
-        }))
-        .send()
-        .await?;
-
-    let res_json: serde_json::Value = res.json().await?;
-    
-    if let Some(choice) = res_json.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.get(0)) {
-        if let Some(message) = choice.get("message").and_then(|m| m.get("content")) {
-            if let Some(nice_str) = message.as_str() {
-                return Ok(nice_str.trim().to_string());
-            }
-        }
-    }
-    Ok("You're awesome! I wish I could come up with something more specific, but you're genuinely great.".to_string())
-}
+// Function removed: get_nice_message - Not used in the current implementation, replaced by get_nice_message_with_custom_info
 
 async fn get_nice_message_with_custom_info(openai_token: &str, username: &str, _user_text: &str, history: &str, user_data: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
     let mut messages = vec![
@@ -1909,77 +1837,4 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
     Ok("You are so bland, I can't even come up with an insult for you.".to_string())
 }
 
-async fn get_insult(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str) -> Result<String> {
-    // Extract any tags from user data to highlight patterns
-    let tags = extract_tags_from_user_data(user_data);
-    let tag_str = if !tags.is_empty() {
-        format!("The user has shown these behavior patterns: {}. Use these insights for a more personalized insult.", tags.join(", "))
-    } else {
-        String::new()
-    };
-    
-    // Extract recent topics from user data
-    let topics = extract_topics_from_user_data(user_data);
-    let topics_str = if !topics.is_empty() {
-        format!("The user frequently talks about: {}. Reference these topics in your insult when relevant.", topics.join(", "))
-    } else {
-        String::new()
-    };
-    
-    let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a hilarious, razor-sharp insult comedian. Create unexpected, clever burns that hit the perfect balance between edgy and funny. TWO SENTENCES MAX. Use absurd comparisons, clever wordplay, and unexpected punchlines. Be specific about their quirks from their message history. Mix in pop culture references when relevant. Your goal is to make everyone laugh, including the person being roasted." }),
-    ];
-
-    if !history.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("Previous conversation: {}", history) }));
-    }
-    
-    // Add user data if available
-    if !user_data.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("User's message history: {}", user_data) }));
-    }
-    
-    // Add the extracted tags and topics
-    if !tag_str.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": tag_str }));
-    }
-    
-    if !topics_str.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": topics_str }));
-    }
-
-    // Analyze current message for context
-    let current_context = analyze_current_message(user_text);
-    if !current_context.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("In their current message, the user is: {}. Consider this context for your insult.", current_context) }));
-    }
-
-    messages.push(serde_json::json!({ "role": "user", "content": format!("I'm {}. My message: '{}'. Roast me based on this specific message AND my past behavior patterns. Make it personal, specific, and hilarious.", username, user_text) }));
-
-    // Log the API request payload for debugging
-    log_api_request(&messages);
-
-    let client = reqwest::Client::new();
-    let res = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(openai_token)
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "messages": messages,
-            "max_tokens": 1000, // Significantly increased max_tokens for more detailed and longer insults
-            "temperature": 1// Slightly higher temperature for more creative/varied insults
-        }))
-        .send()
-        .await?;
-
-    let res_json: serde_json::Value = res.json().await?;
-    
-    if let Some(choice) = res_json.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.get(0)) {
-        if let Some(message) = choice.get("message").and_then(|m| m.get("content")) {
-            if let Some(insult_str) = message.as_str() {
-                return Ok(insult_str.trim().to_string());
-            }
-        }
-    }
-    Ok("You are so bland, I can't even come up with an insult for you.".to_string())
-}
+// Function removed: get_insult - Not used in the current implementation, replaced by get_insult_with_custom_info

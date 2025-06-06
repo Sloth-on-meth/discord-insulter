@@ -40,6 +40,8 @@ In the admin channel, you can use the following commands:
 
 - `!addinfo @user <custom information>` - Add custom information about a user that will be incorporated into insults
 - `!insult @user` - Generate and send an insult to the mentioned user in the insult channel
+- `!voiceinsult` - Join the voice channel with the most users and deliver personalized voice insults to each user
+- `!voicecompliment` - Join the voice channel with the most users and deliver personalized voice compliments to each user
 - `!help` - Show the list of available admin commands
 
 ### Technical Features
@@ -48,6 +50,8 @@ In the admin channel, you can use the following commands:
 - Implements proper async/await patterns to avoid blocking Discord API calls
 - Handles Rust's ownership system correctly to prevent Send trait issues
 - Securely stores sensitive configuration in config.json (excluded from git)
+- Integrates with OpenAI's Text-to-Speech API for voice insults and compliments
+- Uses Songbird for Discord voice channel interactions and audio playback
 
 ## Database Structure
 
