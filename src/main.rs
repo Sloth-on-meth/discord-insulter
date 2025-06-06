@@ -182,7 +182,7 @@ impl Handler {
                     }
                 } else {
                     // Generate the regular insult with custom prompt if provided
-                    match get_insult_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &summary, &custom_info, &custom_prompt).await {
+                    match get_insult_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &summary, &custom_info, &custom_prompt, &msg.author.name).await {
                         Ok(insult) => {
                         // Send the insult to the insult channel and tag the user
                         let insult_channel_id = ChannelId::from(self.config.insult_channel_id.parse::<u64>().unwrap_or(0));
@@ -839,6 +839,7 @@ impl Handler {
                     &user_data, 
                     "", 
                     &custom_info, 
+                    "", 
                     ""
                 ).await {
                     Ok(insult) => {
@@ -1378,7 +1379,7 @@ impl EventHandler for Handler {
         }
         
         // Step 2: Generate insult (async call with no locks held)
-        let insult = match get_insult_with_custom_info(&self.config.openai_token, user_name, user_text, &current_history, &user_data, &summary, "", "").await {
+        let insult = match get_insult_with_custom_info(&self.config.openai_token, user_name, user_text, &current_history, &user_data, &summary, "", "", "").await {
             Ok(insult) => {
                 // Step 3: Update history in DB (again as a synchronous block)
                 {
@@ -1673,7 +1674,7 @@ async fn get_themed_insult(openai_token: &str, username: &str, user_text: &str, 
     Ok("Even my AI humor module crashed trying to roast you... that's how unique you are.".to_string())
 }
 
-async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str, summary: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
+async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str, summary: &str, custom_info: &str, custom_prompt: &str, requested_by: &str) -> Result<String> {
     // Extract tags, topics, and current message context
     let tags = extract_tags_from_user_data(user_data);
     let tag_str = if !tags.is_empty() {
@@ -1707,6 +1708,9 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
     let mut messages = vec![
         serde_json::json!({ "role": "system", "content": "You are a legendary insult comic who loves to argue, banter, and escalate playful disagreements. Your job is to keep the conversation going, provoke comebacks, and create witty, ongoing rivalries. Sometimes reference the user's history/tags/topics/callbacks, but not every time. Always reference the last few exchanges for context. End every insult with a provocative question, challenge, or argument hook to invite the user to reply. Be edgy, clever, and never boring." }),
     ];
+    if !requested_by.is_empty() && requested_by != username {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("This insult is being requested by another user: {}. Respond accordingly, as the target did not request this themselves.", requested_by) }));
+    }
 
     // Always include recent conversation for continuity
     if !history.is_empty() {
