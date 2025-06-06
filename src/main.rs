@@ -6,6 +6,10 @@ use serenity::prelude::*;
 use serde::Deserialize;
 use std::fs;
 use anyhow::Result;
+mod convo_utils;
+mod summarize;
+use convo_utils::{random_chance, random_argument_hook};
+use summarize::summarize_history;
 use rusqlite::{params, Connection, OptionalExtension};
 use reqwest;
 use std::sync::{Arc, Mutex};
@@ -111,31 +115,32 @@ impl Handler {
                 };
                 
                 // Get user data and custom info
-                let (user_data, custom_info) = {
+                // Get user data, summary, and custom info for the mentioned user
+                let (user_data, summary, custom_info) = {
                     let db_lock = self.db.lock().unwrap();
-                    
-                    // Get message data
-                    let data_opt: Option<String> = db_lock
-                        .query_row(
-                            "SELECT message_data FROM user_data WHERE user_id = ?1",
-                            params![user_id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    
-                    // Get custom info
-                    let info_opt: Option<String> = db_lock
-                        .query_row(
-                            "SELECT info FROM custom_user_info WHERE user_id = ?1",
-                            params![&user_id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    
-                    (data_opt.unwrap_or_default(), info_opt.unwrap_or_default())
+                    let mut data = String::new();
+                    let mut summary = String::new();
+                    let mut info = String::new();
+                    let _ = db_lock.query_row(
+                        "SELECT message_data, summary FROM user_data WHERE user_id = ?1",
+                        params![&user_id],
+                        |row| {
+                            data = row.get::<_, String>(0)?;
+                            summary = row.get::<_, String>(1)?;
+                            Ok(())
+                        }
+                    );
+                    let _ = db_lock.query_row(
+                        "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                        params![&user_id],
+                        |row| {
+                            info = row.get::<_, String>(0)?;
+                            Ok(())
+                        }
+                    );
+                    (data, summary, info)
                 };
+
                 
                 // Check if this is a themed insult request
                 if custom_prompt.starts_with("theme:") || custom_prompt.starts_with("style:") {
@@ -177,7 +182,7 @@ impl Handler {
                     }
                 } else {
                     // Generate the regular insult with custom prompt if provided
-                    match get_insult_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &custom_info, &custom_prompt).await {
+                    match get_insult_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &summary, &custom_info, &custom_prompt).await {
                         Ok(insult) => {
                         // Send the insult to the insult channel and tag the user
                         let insult_channel_id = ChannelId::from(self.config.insult_channel_id.parse::<u64>().unwrap_or(0));
@@ -228,31 +233,32 @@ impl Handler {
                 };
                 
                 // Get user data and custom info
-                let (user_data, custom_info) = {
+                // Get user data, summary, and custom info for the mentioned user
+                let (user_data, summary, custom_info) = {
                     let db_lock = self.db.lock().unwrap();
-                    
-                    // Get message data
-                    let data_opt: Option<String> = db_lock
-                        .query_row(
-                            "SELECT message_data FROM user_data WHERE user_id = ?1",
-                            params![user_id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    
-                    // Get custom info
-                    let info_opt: Option<String> = db_lock
-                        .query_row(
-                            "SELECT info FROM custom_user_info WHERE user_id = ?1",
-                            params![&user_id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    
-                    (data_opt.unwrap_or_default(), info_opt.unwrap_or_default())
+                    let mut data = String::new();
+                    let mut summary = String::new();
+                    let mut info = String::new();
+                    let _ = db_lock.query_row(
+                        "SELECT message_data, summary FROM user_data WHERE user_id = ?1",
+                        params![&user_id],
+                        |row| {
+                            data = row.get::<_, String>(0)?;
+                            summary = row.get::<_, String>(1)?;
+                            Ok(())
+                        }
+                    );
+                    let _ = db_lock.query_row(
+                        "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                        params![&user_id],
+                        |row| {
+                            info = row.get::<_, String>(0)?;
+                            Ok(())
+                        }
+                    );
+                    (data, summary, info)
                 };
+
                 
                 // Generate the nice message with custom prompt if provided
                 match get_nice_message_with_custom_info(&self.config.openai_token, user_name, "", &"", &user_data, &custom_info, &custom_prompt).await {
@@ -831,6 +837,7 @@ impl Handler {
                     "", 
                     &history, 
                     &user_data, 
+                    "", 
                     &custom_info, 
                     ""
                 ).await {
@@ -1346,21 +1353,32 @@ impl EventHandler for Handler {
         }; // MutexGuard is dropped here
 
         // Get user data for more personalized insults
-        let user_data = {
+        let (user_data, summary, msg_count): (String, String, usize) = {
             let db_lock = self.db.lock().unwrap();
-            let data_opt: Option<String> = db_lock
-                .query_row(
-                    "SELECT message_data FROM user_data WHERE user_id = ?1",
-                    params![&user_id_str],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            data_opt.unwrap_or_default()
+            let mut stmt = db_lock.prepare("SELECT message_data, summary, COALESCE(LENGTH(message_data) - LENGTH(REPLACE(message_data, '\n', '')) + 1, 0) FROM user_data WHERE user_id = ?1").unwrap();
+            let mut rows = stmt.query(params![&user_id_str]).unwrap();
+            if let Some(row) = rows.next().unwrap() {
+                let data: String = row.get(0).unwrap_or_default();
+                let summary: String = row.get(1).unwrap_or_default();
+                let msg_count: usize = row.get(2).unwrap_or(0);
+                (data, summary, msg_count)
+            } else {
+                (String::new(), String::new(), 0)
+            }
         };
+        // Periodically refresh summary (every 15 messages)
+        if msg_count % 15 == 0 && !user_data.is_empty() {
+            if let Ok(new_summary) = summarize_history(&self.config.openai_token, user_name, &user_data).await {
+                let db_lock = self.db.lock().unwrap();
+                db_lock.execute(
+                    "UPDATE user_data SET summary = ?1 WHERE user_id = ?2",
+                    params![&new_summary, &user_id_str],
+                ).ok();
+            }
+        }
         
         // Step 2: Generate insult (async call with no locks held)
-        let insult = match get_insult(&self.config.openai_token, user_name, user_text, &current_history, &user_data).await {
+        let insult = match get_insult_with_custom_info(&self.config.openai_token, user_name, user_text, &current_history, &user_data, &summary, "", "").await {
             Ok(insult) => {
                 // Step 3: Update history in DB (again as a synchronous block)
                 {
@@ -1655,7 +1673,7 @@ async fn get_themed_insult(openai_token: &str, username: &str, user_text: &str, 
     Ok("Even my AI humor module crashed trying to roast you... that's how unique you are.".to_string())
 }
 
-async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
+async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_text: &str, history: &str, user_data: &str, summary: &str, custom_info: &str, custom_prompt: &str) -> Result<String> {
     // Extract tags, topics, and current message context
     let tags = extract_tags_from_user_data(user_data);
     let tag_str = if !tags.is_empty() {
@@ -1687,18 +1705,31 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
     };
 
     let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a legendary insult comic with perfect comedic timing. Create hilarious, unexpected roasts that subvert expectations. Use absurd comparisons, clever wordplay, and references to the person's messages/behavior. TWO SENTENCES MAX. Channel comedians like Jeff Ross, Anthony Jeselnik, and Dave Attell. Be edgy but not cruel - make people laugh at themselves. Use callbacks to their previous messages when possible." }),
+        serde_json::json!({ "role": "system", "content": "You are a legendary insult comic who loves to argue, banter, and escalate playful disagreements. Your job is to keep the conversation going, provoke comebacks, and create witty, ongoing rivalries. Sometimes reference the user's history/tags/topics/callbacks, but not every time. Always reference the last few exchanges for context. End every insult with a provocative question, challenge, or argument hook to invite the user to reply. Be edgy, clever, and never boring." }),
     ];
 
+    // Always include recent conversation for continuity
     if !history.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("Previous conversation: {}", history) }));
+        messages.push(serde_json::json!({ "role": "system", "content": format!("Recent conversation: {}", history) }));
     }
-    
-    // Add user data if available
-    if !user_data.is_empty() {
-        messages.push(serde_json::json!({ "role": "system", "content": format!("User's message history: {}", user_data) }));
+    // Always include the summary instead of full user_data
+    if !summary.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": format!("Summary of user's message history: {}", summary) }));
     }
-    
+    // Only sometimes include tags, topics, callbacks for more organic feel
+    if random_chance(0.25) && !tag_str.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": tag_str.clone() }));
+    }
+    if random_chance(0.25) && !topics_str.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": topics_str.clone() }));
+    }
+    if random_chance(0.25) && !callback_str.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": callback_str.clone() }));
+    }
+    if !context_str.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": context_str }));
+    }
+
     // Add custom information if available
     if !custom_info.is_empty() {
         messages.push(serde_json::json!({ "role": "system", "content": format!("Special info about user: {}", custom_info) }));
@@ -1723,9 +1754,9 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
 
     // Use custom prompt if provided, otherwise use default
     let prompt_content = if !custom_prompt.is_empty() {
-        format!("I'm {}. {}", username, custom_prompt)
+        format!("I'm {}. {} {}", username, custom_prompt, random_argument_hook())
     } else {
-        format!("Roast {} based on the data you have. Make it personal, specific, and hilarious by using their quirks and message patterns.", username)
+        format!("Roast {} based on the data you have. Make it personal, specific, and hilarious by using their quirks and message patterns. {}", username, random_argument_hook())
     };
     
     messages.push(serde_json::json!({ "role": "user", "content": prompt_content }));
