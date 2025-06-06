@@ -4,6 +4,8 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use serde::Deserialize;
+use songbird::SerenityInit;
+mod tts;
 use std::fs;
 use anyhow::Result;
 mod convo_utils;
@@ -46,6 +48,118 @@ struct Handler {
 impl Handler {
     // Process commands from the admin channel
     async fn process_admin_command(&self, ctx: &Context, msg: &Message) {
+        let guild_id = match msg.guild_id {
+            Some(id) => id,
+            None => {
+                let _ = msg.channel_id.say(&ctx.http, "This command must be used in a server.").await;
+                return;
+            }
+        };
+
+        // Voice insult/compliment
+        if msg.content == "!voiceinsult" || msg.content == "!voicecompliment" {
+            let manager = songbird::get(ctx).await.unwrap().clone();
+            let guild = match guild_id.to_guild_cached(ctx.cache.clone()) {
+                Some(g) => g,
+                None => {
+                    let _ = msg.channel_id.say(&ctx.http, "Guild not found in cache.").await;
+                    return;
+                }
+            };
+            // Find the voice channel with the most users
+            let mut max_count = 0;
+            let mut target_channel = None;
+            
+            // Count users in each voice channel using voice_states
+            let mut channel_counts = std::collections::HashMap::new();
+            for (_user_id, voice_state) in guild.voice_states.iter() {
+                if let Some(channel_id) = voice_state.channel_id {
+                    *channel_counts.entry(channel_id).or_insert(0) += 1;
+                }
+            }
+            
+            // Find the voice channel with the most users
+            for (channel_id, channel) in guild.channels.iter() {
+                // In Serenity 0.11, we need to check the channel type differently
+                if let serenity::model::channel::Channel::Guild(guild_channel) = channel {
+                    if guild_channel.kind == serenity::model::channel::ChannelType::Voice {
+                        let count = *channel_counts.get(channel_id).unwrap_or(&0);
+                        if count > max_count {
+                            max_count = count;
+                            target_channel = Some(channel_id);
+                        }
+                    }
+                }
+            }
+            let target_channel = match target_channel {
+                Some(id) => id,
+                None => {
+                    let _ = msg.channel_id.say(&ctx.http, "No users in any voice channel.").await;
+                    return;
+                }
+            };
+            let connect_handle = manager.join(guild_id, *target_channel).await.0;
+            let mut call = connect_handle.lock().await;
+            let members = guild.voice_states.iter()
+                .filter_map(|(user_id, vs)| if vs.channel_id == Some(*target_channel) { Some(user_id) } else { None })
+                .collect::<Vec<_>>();
+            let member_count = members.len();
+            for user_id in &members {
+                // Skip bots
+                if let Ok(user) = user_id.to_user(&ctx.http).await {
+                    if user.bot { continue; }
+                    let username = &user.name;
+                    let (user_data, summary, custom_info) = {
+                        let db_lock = self.db.lock().unwrap();
+                        let mut data = String::new();
+                        let mut summary = String::new();
+                        let mut info = String::new();
+                        let _ = db_lock.query_row(
+                            "SELECT message_data, summary FROM user_data WHERE user_id = ?1",
+                            params![&user_id.to_string()],
+                            |row| {
+                                data = row.get::<_, String>(0)?;
+                                summary = row.get::<_, String>(1)?;
+                                Ok(())
+                            }
+                        );
+                        let _ = db_lock.query_row(
+                            "SELECT info FROM custom_user_info WHERE user_id = ?1",
+                            params![&user_id.to_string()],
+                            |row| {
+                                info = row.get::<_, String>(0)?;
+                                Ok(())
+                            }
+                        );
+                        (data, summary, info)
+                    };
+                    let text = if msg.content == "!voiceinsult" {
+                        match get_insult_with_custom_info(&self.config.openai_token, username, "", &"", &user_data, &summary, &custom_info, &"", &msg.author.name).await {
+                            Ok(insult) => insult,
+                            Err(_) => format!("Couldn't generate insult for {}.", username)
+                        }
+                    } else {
+                        match get_nice_message_with_custom_info(&self.config.openai_token, username, "", &"", &user_data, &custom_info, &"").await {
+                            Ok(compliment) => compliment,
+                            Err(_) => format!("Couldn't generate compliment for {}.", username)
+                        }
+                    };
+                    if let Ok(audio_path) = tts::tts_to_file(&self.config.openai_token, &text).await {
+                        let source = match songbird::input::ffmpeg(audio_path.clone()).await {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let handle = call.play_source(source);
+                        let _ = handle;
+                    }
+                }
+            }
+            // Wait for all audio to finish (simple sleep, robust version would check queue)
+            tokio::time::sleep(std::time::Duration::from_secs(5 * member_count as u64)).await;
+            let _ = manager.remove(guild_id).await;
+            let _ = msg.channel_id.say(&ctx.http, "Voice operation complete.").await;
+            return;
+        }
         log_info("Processing admin command");
         let content = &msg.content;
         
@@ -407,14 +521,15 @@ impl Handler {
                 
                 // Keep fetching messages until we've got them all
                 loop {
-                    let mut message_builder = serenity::builder::GetMessages::default().limit(100);
-                    
-                    // If we have a last message ID, use it to fetch older messages
-                    if let Some(id) = last_message_id {
-                        message_builder = message_builder.before(id);
-                    }
-                    
-                    match channel_id.messages(&ctx.http, message_builder).await {
+                    // Use closure-based builder per serenity 0.11
+                    match channel_id.messages(&ctx.http, |b| {
+                        let b = b.limit(100);
+                        if let Some(id) = last_message_id {
+                            b.before(id)
+                        } else {
+                            b
+                        }
+                    }).await {
                         Ok(msgs) => {
                             let batch_size = msgs.len();
                             total_channel_messages += batch_size;
@@ -1452,6 +1567,7 @@ async fn main() -> Result<()> {
 
     let mut client = Client::builder(&config.discord_token, GatewayIntents::all())
         .event_handler(handler)
+        .register_songbird()
         .await?;
 
     if let Err(why) = client.start().await {
