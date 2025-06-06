@@ -1580,7 +1580,7 @@ async fn get_nice_message_with_custom_info(openai_token: &str, username: &str, _
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "messages": messages,
-            "max_tokens": 1000,
+            "max_tokens": 150,
             "temperature": 0.8 // Slightly lower temperature for more consistent positive messages
         }))
         .send()
@@ -1750,7 +1750,7 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
     };
 
     let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": "You are a legendary insult comic who loves to argue, banter, and escalate playful disagreements. Your job is to keep the conversation going, provoke comebacks, and create witty, ongoing rivalries. Sometimes reference the user's history/tags/topics/callbacks, but not every time. Always reference the last few exchanges for context. End every insult with a provocative question, challenge, or argument hook to invite the user to reply. Be edgy, clever, and never boring." }),
+        serde_json::json!({ "role": "system", "content": "You are a legendary insult comic who creates short, witty insults. Keep your responses under 2 sentences. Be concise, sharp, and clever. Sometimes reference the user's history/tags/topics, but not every time. Be edgy but brief." }),
     ];
     if !requested_by.is_empty() && requested_by != username {
         messages.push(serde_json::json!({ "role": "system", "content": format!("This insult is being requested by another user: {}. Respond accordingly, as the target did not request this themselves.", requested_by) }));
@@ -1819,7 +1819,7 @@ async fn get_insult_with_custom_info(openai_token: &str, username: &str, user_te
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "messages": messages,
-            "max_tokens": 1000, // Significantly increased max_tokens for more detailed and longer insults
+            "max_tokens": 150, // Reduced max_tokens for shorter, more concise insults
             "temperature": 1 // Slightly higher temperature for more creative/varied insults
         }))
         .send()
